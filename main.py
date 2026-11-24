@@ -14,10 +14,17 @@ program enforces the gate strictly so an invalid line can never ship:
 length, single line, single sentence (exactly one terminal period, at
 the end), no leading/trailing whitespace, no double spaces, no '!'/'?'.
 
+Structure: each gate rule is one small check function registered in
+CHECKS; ``validate`` runs them and collects failures. Writing and
+reading go through ``write_entry`` / ``read_entry``, and every write is
+followed by ``verify_file_matches`` so a truncated or re-encoded file
+is caught immediately instead of shipping silently.
+
 Usage:
     python3 main.py --self-test   # validate + byte-identical round-trip
     python3 main.py --check       # validate ENTRY only, write nothing
     python3 main.py               # validate and write entry.txt
+    python3 main.py --out DIR     # write entry.txt under DIR instead
 """
 
 import argparse
@@ -30,6 +37,8 @@ ENTRY = (
 )
 
 MAX_CHARS = 140
+ENTRY_FILENAME = "entry.txt"
+DEFAULT_OUT_DIR = "/output"
 
 
 def count_sentences(text: str) -> int:
@@ -46,39 +55,113 @@ def count_sentences(text: str) -> int:
     )
 
 
-def validate(text: str) -> list[str]:
-    """Return a list of gate failures for `text` (empty means valid)."""
-    problems = []
+def _check_length(text: str) -> str | None:
     if not 1 <= len(text) <= MAX_CHARS:
-        problems.append(f"length {len(text)} chars, must be 1-{MAX_CHARS}")
+        return f"length {len(text)} chars, must be 1-{MAX_CHARS}"
+    return None
+
+
+def _check_not_blank(text: str) -> str | None:
     if not text.strip():
-        problems.append("entry is only white space")
+        return "entry is only white space"
+    return None
+
+
+def _check_no_edge_whitespace(text: str) -> str | None:
     if text != text.strip():
-        problems.append("entry has leading or trailing whitespace")
+        return "entry has leading or trailing whitespace"
+    return None
+
+
+def _check_no_double_spaces(text: str) -> str | None:
     if "  " in text:
-        problems.append("entry contains double spaces")
+        return "entry contains double spaces"
+    return None
+
+
+def _check_single_line(text: str) -> str | None:
     if "\n" in text or "\r" in text:
-        problems.append("entry must be a single line")
+        return "entry must be a single line"
+    return None
+
+
+def _check_single_sentence(text: str) -> str | None:
     if count_sentences(text) != 1 or not text.endswith("."):
-        problems.append("entry must be exactly one sentence "
-                        "(one period, at the end)")
+        return ("entry must be exactly one sentence "
+                "(one period, at the end)")
+    return None
+
+
+def _check_no_other_terminators(text: str) -> str | None:
     if "!" in text or "?" in text:
-        problems.append("entry must not contain '!' or '?' "
-                        "(one sentence only)")
+        return "entry must not contain '!' or '?' (one sentence only)"
+    return None
+
+
+def _check_utf8(text: str) -> str | None:
     try:
         text.encode("utf-8")
     except UnicodeEncodeError as exc:  # pragma: no cover - defensive
-        problems.append(f"not encodable as UTF-8: {exc}")
-    return problems
+        return f"not encodable as UTF-8: {exc}"
+    return None
+
+
+# Every gate rule, in the order its failure is reported. Each check
+# returns None when the rule passes, or a human-readable problem.
+CHECKS = (
+    _check_length,
+    _check_not_blank,
+    _check_no_edge_whitespace,
+    _check_no_double_spaces,
+    _check_single_line,
+    _check_single_sentence,
+    _check_no_other_terminators,
+    _check_utf8,
+)
+
+
+def validate(text: str) -> list[str]:
+    """Return a list of gate failures for `text` (empty means valid)."""
+    return [msg for check in CHECKS if (msg := check(text)) is not None]
+
+
+def resolve_out_dir(cli_out: str | None) -> str:
+    """Pick the output directory: --out wins, then $MAKEFUN_OUTPUT_DIR.
+
+    An explicitly empty --out value is rejected rather than silently
+    falling back, so a typo cannot redirect the entry elsewhere.
+    """
+    if cli_out is not None:
+        if not cli_out.strip():
+            raise ValueError("--out must not be empty")
+        return cli_out
+    return os.environ.get("MAKEFUN_OUTPUT_DIR", DEFAULT_OUT_DIR)
 
 
 def write_entry(out_dir: str) -> str:
-    """Write ENTRY to entry.txt under `out_dir`; return the file path."""
+    """Write ENTRY to entry.txt under `out_dir`; return the file path.
+
+    The file is opened with newline="" so no platform line-ending
+    translation can sneak a newline into the judged bytes.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "entry.txt")
+    path = os.path.join(out_dir, ENTRY_FILENAME)
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(ENTRY)
     return path
+
+
+def read_entry(path: str) -> str:
+    """Read back an entry file as text, preserving its exact bytes."""
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def verify_file_matches(path: str) -> bool:
+    """True when the file at `path` holds exactly ENTRY, byte for byte."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw == ENTRY.encode("utf-8") and raw.decode("utf-8") == ENTRY
 
 
 def self_test() -> int:
@@ -91,13 +174,11 @@ def self_test() -> int:
         return 1
     with tempfile.TemporaryDirectory() as tmp:
         path = write_entry(tmp)
-        with open(path, "rb") as f:
-            raw = f.read()
-        if raw != ENTRY.encode("utf-8"):
+        if not verify_file_matches(path):
             print("self-test FAIL: read-back bytes differ from ENTRY",
                   file=sys.stderr)
             return 1
-        if raw.decode("utf-8") != ENTRY:
+        if read_entry(path) != ENTRY:
             print("self-test FAIL: read-back text differs from ENTRY",
                   file=sys.stderr)
             return 1
@@ -130,13 +211,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"check OK: {len(ENTRY)} chars, single sentence, valid")
         return 0
 
-    out_dir = args.out or os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    try:
+        out_dir = resolve_out_dir(args.out)
+    except ValueError as exc:
+        print(f"invalid output directory: {exc}", file=sys.stderr)
+        return 1
     path = write_entry(out_dir)
     # Read back and confirm the file holds exactly the entry.
-    with open(path, encoding="utf-8") as f:
-        if f.read() != ENTRY:
-            print(f"read-back mismatch in {path}", file=sys.stderr)
-            return 1
+    if not verify_file_matches(path):
+        print(f"read-back mismatch in {path}", file=sys.stderr)
+        return 1
     print(f"wrote {path} ({len(ENTRY)} chars)")
     return 0
 
